@@ -29,11 +29,37 @@
  *   Left Joystick X-axis  -> Steering (left/right)
  *   Button A (or R1)      -> Turbo mode (increased speed limit)
  *   Button B (or L1)      -> Emergency stop (sets speed & steer to 0)
+ *   Button X              -> Toggle Follow Me mode (RSSI-based)
+ *   Button Y              -> RSSI/Direction calibration print
+ *
+ * Follow Me Mode:
+ *   When enabled (Button X toggle), the hoverboard automatically
+ *   adjusts speed based on BT signal strength (RSSI).
+ *   - Closer signal = stop/reverse
+ *   - Farther signal = drive forward
+ *
+ * Dual-ESP32 Direction Detection:
+ *   When a Satellite ESP32 is present on the opposite sideboard,
+ *   the direction to the user is estimated from RSSI difference.
+ *   - Steering is automatic when direction data is available
+ *   - Manual joystick steering overrides auto-steering
+ *   - Without Satellite, steering remains manual-only
  */
 
 #include <Arduino.h>
 #include <Bluepad32.h>
+#include <WiFi.h>
+#include <esp_now.h>
 #include "hoverboard_serial.h"
+#include "follow_me.h"
+#include "espnow_protocol.h"
+#include "direction_detect.h"
+
+// Access Bluepad32 internals for RSSI reading
+extern "C" {
+    #include "uni_hid_device.h"
+    #include "bt/uni_bt.h"
+}
 
 // ========================== PIN Configuration ==========================
 // UART2 pins for hoverboard communication
@@ -70,6 +96,17 @@ int16_t cmdSteer = 0;
 int16_t cmdSpeed = 0;
 bool turboMode = false;
 bool emergencyStop = false;
+
+// Follow Me mode
+FollowMe followMe;
+DirectionDetector dirDetector;
+bool followMeButtonPrev = false;   // For edge detection on toggle button
+bool rssiCalibButtonPrev = false;  // For edge detection on calibration button
+unsigned long lastRssiReadTime = 0;
+
+// ESP-NOW / Satellite state
+bool satelliteOnline = false;
+unsigned long lastSatelliteMsg = 0;
 
 // Timing
 unsigned long lastSendTime = 0;
@@ -172,6 +209,101 @@ void onDisconnectedController(ControllerPtr ctl) {
     }
 }
 
+// ========================== ESP-NOW (Satellite Communication) ==========================
+
+/**
+ * @brief ESP-NOW receive callback - handles messages from Satellite ESP32
+ */
+void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
+    if (len < (int)sizeof(EspNowHeader)) return;
+
+    const EspNowHeader* hdr = (const EspNowHeader*)data;
+    if (!espnow_validate_header(hdr)) return;
+
+    lastSatelliteMsg = millis();
+    satelliteOnline = true;
+
+    switch (hdr->msgType) {
+        case MSG_TYPE_RSSI_REPORT: {
+            if (len >= (int)sizeof(EspNowRssiReport)) {
+                const EspNowRssiReport* report = (const EspNowRssiReport*)data;
+                if (report->targetFound) {
+                    dirDetector.updateSatelliteRssi(report->rssi_raw, report->confidence);
+                }
+            }
+            break;
+        }
+
+        case MSG_TYPE_HEARTBEAT: {
+            // Satellite is alive but may not have found the target
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+/**
+ * @brief Initialize ESP-NOW for receiving Satellite data
+ * @return true if successful
+ */
+bool setupEspNow() {
+    // WiFi must be in STA mode for ESP-NOW
+    // Note: Bluepad32 uses BT, not WiFi, so this should not conflict
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    Serial.printf("[ESPNOW] Master MAC: %s\n", WiFi.macAddress().c_str());
+    Serial.println("[ESPNOW] Set this MAC in the Satellite's masterMacAddress[]!");
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ESPNOW] Init failed!");
+        return false;
+    }
+
+    esp_now_register_recv_cb(onEspNowDataRecv);
+
+    Serial.println("[ESPNOW] Ready, waiting for Satellite...");
+    return true;
+}
+
+// ========================== RSSI Reading ==========================
+
+/**
+ * @brief Read RSSI from the Bluepad32 internal device structure
+ * @param ctl Controller pointer
+ * @return RSSI value (0-255, higher = closer) or 0 if not available
+ */
+uint8_t readControllerRssi(ControllerPtr ctl) {
+    if (ctl == nullptr) return 0;
+
+    // Iterate through Bluepad32's internal device list to find
+    // the device matching this controller and read its RSSI
+    for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
+        uni_hid_device_t* dev = uni_hid_device_get_instance_for_idx(i);
+        if (dev != nullptr && uni_bt_conn_is_connected(&dev->conn)) {
+            return dev->conn.rssi;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Request a fresh RSSI reading from the BT stack
+ *        This triggers a GAP_EVENT_RSSI_MEASUREMENT which updates conn.rssi
+ */
+void requestRssiUpdate() {
+    for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
+        uni_hid_device_t* dev = uni_hid_device_get_instance_for_idx(i);
+        if (dev != nullptr && uni_bt_conn_is_connected(&dev->conn) &&
+            dev->conn.handle != UNI_BT_CONN_HANDLE_INVALID) {
+            // Request RSSI update from BT stack (result arrives async in packet handler)
+            gap_read_rssi(dev->conn.handle);
+        }
+    }
+}
+
 // ========================== Process Gamepad ==========================
 
 void processGamepad(ControllerPtr ctl) {
@@ -200,34 +332,111 @@ void processGamepad(ControllerPtr ctl) {
     // Button B or L1 = Emergency stop
     emergencyStop = (buttons & BUTTON_B) || (buttons & BUTTON_SHOULDER_L);
 
+    // Button X = Toggle Follow Me mode (edge detection: only on press, not hold)
+    bool followMeButton = (buttons & BUTTON_X) != 0;
+    if (followMeButton && !followMeButtonPrev) {
+        followMe.toggle();
+    }
+    followMeButtonPrev = followMeButton;
+
+    // Button Y = Print RSSI/Direction calibration info (edge detection)
+    bool rssiCalibButton = (buttons & BUTTON_Y) != 0;
+    if (rssiCalibButton && !rssiCalibButtonPrev) {
+        uint8_t rssi = readControllerRssi(ctl);
+        Serial.printf("[RSSI-CAL] Raw RSSI=%u, Filtered=%.1f, Zone=%s\n",
+                      rssi, followMe.getFilteredRssi(), followMe.getZoneName());
+        if (dirDetector.isAvailable()) {
+            dirDetector.printCalibration();
+        } else {
+            Serial.println("[RSSI-CAL] Direction: not available (no Satellite data)");
+        }
+        Serial.println("[RSSI-CAL] Hold gamepad at desired distance and note these values.");
+        Serial.println("[RSSI-CAL] Adjust RSSI_ZONE_* thresholds in follow_me.h accordingly.");
+    }
+    rssiCalibButtonPrev = rssiCalibButton;
+
     // Determine speed limit based on turbo mode
     int16_t speedLimit = turboMode ? SPEED_LIMIT_TURBO : SPEED_LIMIT_NORMAL;
     int16_t steerLimit = STEER_LIMIT;
 
     if (emergencyStop) {
-        // Emergency stop: zero all outputs
+        // Emergency stop: zero all outputs (overrides Follow Me)
         cmdSteer = 0;
         cmdSpeed = 0;
+        if (followMe.isEnabled()) {
+            followMe.disable();
+            Serial.println("[FOLLOW] Emergency stop - Follow Me disabled");
+        }
+    } else if (followMe.isEnabled()) {
+        // === FOLLOW ME MODE ===
+        // Speed comes from RSSI-based distance estimation
+        cmdSpeed = followMe.getFollowSpeed();
+
+        // Steering: auto-direction from Dual-ESP32 if available,
+        // otherwise manual via joystick
+        int16_t manualSteer = mapJoystick(axisX, JOYSTICK_DEADZONE, steerLimit);
+
+        if (manualSteer != 0) {
+            // Manual joystick always overrides auto-steering
+            cmdSteer = manualSteer;
+        } else if (followMe.hasDirection()) {
+            // Auto-steering from direction detection (Dual-ESP32)
+            cmdSteer = followMe.getDirectionSteer();
+        } else {
+            cmdSteer = 0;
+        }
+
+        // D-Pad can override steering in Follow Me mode
+        uint8_t dpad = ctl->dpad();
+        if (dpad & DPAD_LEFT) {
+            cmdSteer = -steerLimit / 2;
+        }
+        if (dpad & DPAD_RIGHT) {
+            cmdSteer = steerLimit / 2;
+        }
     } else {
+        // === NORMAL MODE ===
         // Map joystick to commands
         // Y-axis: forward is typically negative on most gamepads, so invert
         cmdSpeed = mapJoystick(-axisY, JOYSTICK_DEADZONE, speedLimit);
         cmdSteer = mapJoystick(axisX, JOYSTICK_DEADZONE, steerLimit);
+
+        // D-Pad for fine control (optional, overrides joystick if pressed)
+        uint8_t dpad = ctl->dpad();
+        if (dpad & DPAD_UP) {
+            cmdSpeed = speedLimit / 3;    // Slow forward
+        }
+        if (dpad & DPAD_DOWN) {
+            cmdSpeed = -speedLimit / 3;   // Slow backward
+        }
+        if (dpad & DPAD_LEFT) {
+            cmdSteer = -steerLimit / 2;   // Turn left
+        }
+        if (dpad & DPAD_RIGHT) {
+            cmdSteer = steerLimit / 2;    // Turn right
+        }
     }
 
-    // D-Pad for fine control (optional, overrides joystick if pressed)
-    uint8_t dpad = ctl->dpad();
-    if (dpad & DPAD_UP) {
-        cmdSpeed = speedLimit / 3;    // Slow forward
-    }
-    if (dpad & DPAD_DOWN) {
-        cmdSpeed = -speedLimit / 3;   // Slow backward
-    }
-    if (dpad & DPAD_LEFT) {
-        cmdSteer = -steerLimit / 2;   // Turn left
-    }
-    if (dpad & DPAD_RIGHT) {
-        cmdSteer = steerLimit / 2;    // Turn right
+    // === RSSI Update ===
+    // Read RSSI periodically for Follow Me mode + Direction detection
+    unsigned long now = millis();
+    if (now - lastRssiReadTime >= RSSI_READ_INTERVAL_MS) {
+        lastRssiReadTime = now;
+
+        // Request fresh RSSI from BT stack
+        requestRssiUpdate();
+
+        // Read current RSSI value
+        uint8_t rssi = readControllerRssi(ctl);
+        if (rssi > 0) {
+            followMe.updateRssi(rssi);
+
+            // Feed master RSSI to direction detector
+            dirDetector.updateMasterRssi(rssi);
+
+            // Update Follow Me with direction steering (if available)
+            followMe.setDirectionSteer(dirDetector.getDirectionSteer());
+        }
     }
 }
 
@@ -239,6 +448,8 @@ void setup() {
     Serial.println();
     Serial.println("============================================");
     Serial.println("  ESP32 Mocute 052 -> Hoverboard Controller");
+    Serial.println("       + Follow Me Mode (RSSI-based)");
+    Serial.println("       + Dual-ESP32 Direction Detection");
     Serial.println("============================================");
     Serial.println();
 
@@ -254,6 +465,15 @@ void setup() {
     // Send initial stop command
     hoverSerial.send(0, 0);
 
+    // Initialize ESP-NOW for Satellite communication (Dual-ESP32 direction detection)
+    Serial.println("[ESPNOW] Initializing ESP-NOW for Satellite communication...");
+    if (setupEspNow()) {
+        Serial.println("[ESPNOW] ESP-NOW ready. Satellite can connect for direction detection.");
+    } else {
+        Serial.println("[ESPNOW] ESP-NOW init failed. Direction detection unavailable.");
+        Serial.println("[ESPNOW] Follow Me will work with distance-only (no direction).");
+    }
+
     // Initialize Bluepad32
     Serial.println("[BP32]  Initializing Bluepad32...");
     BP32.setup(&onConnectedController, &onDisconnectedController);
@@ -266,6 +486,17 @@ void setup() {
 
     Serial.println("[BP32]  Ready! Waiting for Mocute 052 gamepad...");
     Serial.println("[BP32]  Turn on the Mocute 052 and set it to Game mode.");
+    Serial.println();
+    Serial.println("Controls:");
+    Serial.println("  Joystick L  = Steer + Speed");
+    Serial.println("  Button A/R1 = Turbo");
+    Serial.println("  Button B/L1 = Emergency Stop");
+    Serial.println("  Button X    = Toggle Follow Me mode");
+    Serial.println("  Button Y    = Print RSSI/Direction calibration values");
+    Serial.println();
+    Serial.println("Dual-ESP32:");
+    Serial.println("  Satellite auto-detected via ESP-NOW");
+    Serial.println("  When online: auto-steering in Follow Me mode");
     Serial.println();
 
     // Initialize controller slots
@@ -326,8 +557,24 @@ void loop() {
         static unsigned long lastDebugPrint = 0;
         if (now - lastDebugPrint > 500) {
             lastDebugPrint = now;
-            Serial.printf("[CMD] steer=%4d speed=%4d turbo=%d estop=%d connected=%d\n",
-                          cmdSteer, cmdSpeed, turboMode, emergencyStop, gamepadConnected);
+            if (followMe.isEnabled()) {
+                if (dirDetector.isAvailable()) {
+                    Serial.printf("[FOLLOW] steer=%4d speed=%4d zone=%s dir=%s rssi_m=%u rssi_s=%u diff=%.0f\n",
+                                  cmdSteer, cmdSpeed, followMe.getZoneName(),
+                                  dirDetector.getZoneName(),
+                                  dirDetector.getMasterRssi(), dirDetector.getSatelliteRssi(),
+                                  dirDetector.getFilteredDiff());
+                } else {
+                    Serial.printf("[FOLLOW] steer=%4d speed=%4d zone=%s rssi=%u(%.0f) sat=%s\n",
+                                  cmdSteer, cmdSpeed, followMe.getZoneName(),
+                                  followMe.getRawRssi(), followMe.getFilteredRssi(),
+                                  dirDetector.isSatelliteOnline() ? "online" : "offline");
+                }
+            } else {
+                Serial.printf("[CMD] steer=%4d speed=%4d turbo=%d estop=%d connected=%d sat=%s\n",
+                              cmdSteer, cmdSpeed, turboMode, emergencyStop, gamepadConnected,
+                              dirDetector.isSatelliteOnline() ? "online" : "offline");
+            }
         }
     }
 
