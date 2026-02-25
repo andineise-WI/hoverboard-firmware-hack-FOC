@@ -48,8 +48,9 @@
 
 #include <Arduino.h>
 #include <Bluepad32.h>
-#include <WiFi.h>
-#include <esp_now.h>
+// WiFi/ESP-NOW disabled: conflicts with Bluepad32's BTstack radio control
+// #include <WiFi.h>
+// #include <esp_now.h>
 #include "hoverboard_serial.h"
 #include "follow_me.h"
 #include "espnow_protocol.h"
@@ -58,13 +59,15 @@
 // Access Bluepad32 internals for RSSI reading
 extern "C" {
     #include "uni_hid_device.h"
-    #include "bt/uni_bt.h"
+    #include "uni_bt.h"
 }
 
 // ========================== PIN Configuration ==========================
 // UART2 pins for hoverboard communication
-#define HOVER_RX_PIN    16    // ESP32 RX <- Hoverboard TX
-#define HOVER_TX_PIN    17    // ESP32 TX -> Hoverboard RX
+// NOTE: GPIO16/17 are used by PSRAM in the Bluepad32 framework!
+//       Must use alternative pins.
+#define HOVER_RX_PIN    25    // ESP32 RX <- Hoverboard TX
+#define HOVER_TX_PIN    26    // ESP32 TX -> Hoverboard RX
 
 // Status LED
 #define LED_PIN         2     // Built-in LED on most ESP32 DevKit boards
@@ -164,6 +167,31 @@ void onConnectedController(ControllerPtr ctl) {
                           ctl->getModelName().c_str(),
                           properties.vendor_id,
                           properties.product_id);
+
+            // Print BT protocol type
+            if (ctl->isGamepad())        Serial.println("[BP32] Type: Gamepad");
+            else if (ctl->isMouse())     Serial.println("[BP32] Type: Mouse");
+            else if (ctl->isKeyboard())  Serial.println("[BP32] Type: Keyboard");
+            else if (ctl->isBalanceBoard()) Serial.println("[BP32] Type: Balance Board");
+            else                         Serial.println("[BP32] Type: Unknown");
+
+            // Print BT transport from Bluepad32 internals
+            uni_hid_device_t* dev = uni_hid_device_get_instance_for_idx(i);
+            if (dev != nullptr) {
+                const char* btProto = "Unknown";
+                switch (dev->conn.protocol) {
+                    case UNI_BT_CONN_PROTOCOL_BR_EDR: btProto = "BR/EDR (Classic BT)"; break;
+                    case UNI_BT_CONN_PROTOCOL_BLE:    btProto = "BLE (Bluetooth Low Energy)"; break;
+                    default: break;
+                }
+                Serial.printf("[BP32] BT Protocol: %s\n", btProto);
+                char addr_str[18];
+                snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         dev->conn.btaddr[0], dev->conn.btaddr[1], dev->conn.btaddr[2],
+                         dev->conn.btaddr[3], dev->conn.btaddr[4], dev->conn.btaddr[5]);
+                Serial.printf("[BP32] BT Address: %s\n", addr_str);
+                Serial.printf("[BP32] Connection handle: 0x%04x\n", dev->conn.handle);
+            }
             break;
         }
     }
@@ -210,10 +238,11 @@ void onDisconnectedController(ControllerPtr ctl) {
 }
 
 // ========================== ESP-NOW (Satellite Communication) ==========================
+// DISABLED: WiFi/ESP-NOW conflicts with Bluepad32's BTstack radio control
+// causing WDT reset. All ESP-NOW code commented out until a compatible
+// solution is found (e.g. using esp_wifi_start() directly instead of Arduino WiFi).
 
-/**
- * @brief ESP-NOW receive callback - handles messages from Satellite ESP32
- */
+/*
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
     if (len < (int)sizeof(EspNowHeader)) return;
 
@@ -235,7 +264,6 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
         }
 
         case MSG_TYPE_HEARTBEAT: {
-            // Satellite is alive but may not have found the target
             break;
         }
 
@@ -244,13 +272,7 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
     }
 }
 
-/**
- * @brief Initialize ESP-NOW for receiving Satellite data
- * @return true if successful
- */
 bool setupEspNow() {
-    // WiFi must be in STA mode for ESP-NOW
-    // Note: Bluepad32 uses BT, not WiFi, so this should not conflict
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
@@ -267,26 +289,31 @@ bool setupEspNow() {
     Serial.println("[ESPNOW] Ready, waiting for Satellite...");
     return true;
 }
+*/
 
 // ========================== RSSI Reading ==========================
 
+// Store last RSSI value received via HCI event
+static int8_t lastRssiValue = 0;
+
 /**
- * @brief Read RSSI from the Bluepad32 internal device structure
+ * @brief Read RSSI from the last HCI measurement result
  * @param ctl Controller pointer
  * @return RSSI value (0-255, higher = closer) or 0 if not available
+ *
+ * Note: Bluepad32 v3.x does not store RSSI in the connection struct.
+ * We request RSSI via gap_read_rssi() and the result arrives
+ * asynchronously via HCI. We store it in lastRssiValue.
+ * The value is converted: RSSI_dBm is negative (e.g. -60),
+ * we convert to 0-255 range: mapped = constrain(100 + rssi_dbm, 0, 255)
  */
 uint8_t readControllerRssi(ControllerPtr ctl) {
     if (ctl == nullptr) return 0;
 
-    // Iterate through Bluepad32's internal device list to find
-    // the device matching this controller and read its RSSI
-    for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
-        uni_hid_device_t* dev = uni_hid_device_get_instance_for_idx(i);
-        if (dev != nullptr && uni_bt_conn_is_connected(&dev->conn)) {
-            return dev->conn.rssi;
-        }
-    }
-    return 0;
+    // Convert raw RSSI (dBm, typically -100 to 0) to 0-255 range
+    // where higher = closer
+    int mapped = 100 + (int)lastRssiValue;  // e.g. -60 dBm -> 40
+    return (uint8_t)constrain(mapped * 2, 0, 255);
 }
 
 /**
@@ -307,13 +334,13 @@ void requestRssiUpdate() {
 // ========================== Process Gamepad ==========================
 
 void processGamepad(ControllerPtr ctl) {
-    if (ctl == nullptr || !ctl->isConnected() || !ctl->hasData()) {
+    if (ctl == nullptr || !ctl->isConnected()) {
         return;
     }
 
-    if (!ctl->isGamepad()) {
-        return;
-    }
+    // Accept any controller type - Mocute 052 emulates Xbox One via BLE
+    // and may not be classified as "Gamepad" by Bluepad32 v3.x
+    // if (!ctl->isGamepad()) { return; }
 
     lastGamepadTime = millis();
 
@@ -445,6 +472,7 @@ void processGamepad(ControllerPtr ctl) {
 void setup() {
     // Initialize debug serial
     Serial.begin(115200);
+    delay(1000);  // Give BTstack time to fully initialize on Core 0
     Serial.println();
     Serial.println("============================================");
     Serial.println("  ESP32 Mocute 052 -> Hoverboard Controller");
@@ -452,20 +480,38 @@ void setup() {
     Serial.println("       + Dual-ESP32 Direction Detection");
     Serial.println("============================================");
     Serial.println();
+    Serial.flush();
 
+    Serial.println("[DBG] Step 1: LED setup...");
+    Serial.flush();
     // LED setup
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
+    Serial.println("[DBG] Step 2: Hoverboard serial...");
+    Serial.flush();
     // Initialize hoverboard serial
     hoverSerial.begin();
     Serial.printf("[HOVER] Serial initialized at %d baud (RX=%d, TX=%d)\n",
                   HOVER_SERIAL_BAUD, HOVER_RX_PIN, HOVER_TX_PIN);
+    Serial.flush();
 
     // Send initial stop command
     hoverSerial.send(0, 0);
 
-    // Initialize ESP-NOW for Satellite communication (Dual-ESP32 direction detection)
+    Serial.println("[DBG] Step 3: Bluepad32 setup...");
+    Serial.flush();
+    // Initialize Bluepad32
+    BP32.setup(&onConnectedController, &onDisconnectedController);
+    Serial.println("[DBG] Step 3: Bluepad32 setup DONE");
+    Serial.flush();
+
+    // ESP-NOW disabled: WiFi.mode(WIFI_STA) conflicts with Bluepad32's BTstack
+    // which directly controls the radio. This causes WDT reset.
+    // TODO: Investigate Bluepad32-compatible ESP-NOW initialization
+    Serial.println("[ESPNOW] ESP-NOW disabled (incompatible with BTstack radio control)");
+    Serial.println("[ESPNOW] Direction detection unavailable. Follow Me = distance-only.");
+    /*
     Serial.println("[ESPNOW] Initializing ESP-NOW for Satellite communication...");
     if (setupEspNow()) {
         Serial.println("[ESPNOW] ESP-NOW ready. Satellite can connect for direction detection.");
@@ -473,10 +519,7 @@ void setup() {
         Serial.println("[ESPNOW] ESP-NOW init failed. Direction detection unavailable.");
         Serial.println("[ESPNOW] Follow Me will work with distance-only (no direction).");
     }
-
-    // Initialize Bluepad32
-    Serial.println("[BP32]  Initializing Bluepad32...");
-    BP32.setup(&onConnectedController, &onDisconnectedController);
+    */
 
     // Optionally forget previously paired devices to allow new pairing
     // BP32.forgetBluetoothKeys();
@@ -509,14 +552,12 @@ void setup() {
 
 void loop() {
     // Must call this to process Bluepad32 events
-    bool dataUpdated = BP32.update();
+    BP32.update();
 
-    if (dataUpdated) {
-        // Process all connected controllers
-        for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
-            if (myControllers[i] != nullptr && myControllers[i]->isConnected()) {
-                processGamepad(myControllers[i]);
-            }
+    // Process all connected controllers
+    for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+        if (myControllers[i] != nullptr && myControllers[i]->isConnected()) {
+            processGamepad(myControllers[i]);
         }
     }
 
