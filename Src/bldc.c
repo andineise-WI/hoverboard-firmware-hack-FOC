@@ -132,7 +132,7 @@ void DMA1_Channel1_IRQHandler(void) {
 
   // Create square wave for buzzer and more
   buzzerTimer++;
-#ifdef BUZZER_ENABLED
+#if BUZZER_ENABLE
   if (buzzerFreq != 0 && (buzzerTimer / 5000) % (buzzerPattern + 1) == 0) {
     if (buzzerPrev == 0) {
       buzzerPrev = 1;

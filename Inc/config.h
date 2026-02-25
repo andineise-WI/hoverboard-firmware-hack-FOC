@@ -262,7 +262,7 @@
 
 
 // ############################### BUZZER ENABLE / DISABLE ###############################
-#define BUZZER_ENABLED              // If enabled the buzzer will buzz, otherwise not.
+#define BUZZER_ENABLE            0   // 1: buzzer enabled, 0: buzzer disabled
 // ########################### END OF BUZZER ENABLE / DISABLE ############################
 
 
