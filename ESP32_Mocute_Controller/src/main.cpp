@@ -64,13 +64,24 @@ extern "C" {
 
 // ========================== PIN Configuration ==========================
 // UART2 pins for hoverboard communication
-// NOTE: GPIO16/17 are used by PSRAM in the Bluepad32 framework!
-//       Must use alternative pins.
-#define HOVER_RX_PIN    25    // ESP32 RX <- Hoverboard TX
-#define HOVER_TX_PIN    26    // ESP32 TX -> Hoverboard RX
+// NOTE: GPIO16/17 are used by PSRAM on ESP32 with Bluepad32 framework!
+//       GPIO25/26 don't exist on ESP32-S3!
+//       Using build flags to set per-target pins.
+#ifndef HOVER_RX_PIN
+  #define HOVER_RX_PIN    25    // Default for ESP32 (override via build_flags)
+#endif
+#ifndef HOVER_TX_PIN
+  #define HOVER_TX_PIN    26    // Default for ESP32 (override via build_flags)
+#endif
 
 // Status LED
-#define LED_PIN         2     // Built-in LED on most ESP32 DevKit boards
+#ifndef LED_PIN
+  #ifdef CONFIG_IDF_TARGET_ESP32S3
+    #define LED_PIN       48    // ESP32-S3 DevKit built-in RGB LED (WS2812) or use 2
+  #else
+    #define LED_PIN       2     // ESP32 DevKit built-in LED
+  #endif
+#endif
 
 // ========================== Gamepad Settings ==========================
 // Joystick deadzone (Mocute 052 joysticks may not center perfectly)
