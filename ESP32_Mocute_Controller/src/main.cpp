@@ -342,6 +342,86 @@ void requestRssiUpdate() {
     }
 }
 
+// ========================== Debug: Button Monitor ==========================
+
+/**
+ * @brief Print all currently pressed buttons, D-Pad, axes and triggers.
+ *        Only prints when input changes to avoid serial spam.
+ */
+void debugPrintButtons(ControllerPtr ctl) {
+    static uint16_t prevButtons = 0;
+    static uint16_t prevMiscButtons = 0;
+    static uint8_t  prevDpad = 0;
+    static int32_t  prevAxisX = 0, prevAxisY = 0;
+    static int32_t  prevAxisRX = 0, prevAxisRY = 0;
+    static int32_t  prevBrake = 0, prevThrottle = 0;
+
+    uint16_t buttons     = ctl->buttons();
+    uint16_t miscButtons = ctl->miscButtons();
+    uint8_t  dpad        = ctl->dpad();
+    int32_t  axisX       = ctl->axisX();
+    int32_t  axisY       = ctl->axisY();
+    int32_t  axisRX      = ctl->axisRX();
+    int32_t  axisRY      = ctl->axisRY();
+    int32_t  brake       = ctl->brake();
+    int32_t  throttle    = ctl->throttle();
+
+    // Check if anything changed (use deadzone for axes to reduce noise)
+    bool axesChanged = (abs(axisX - prevAxisX) > 20) || (abs(axisY - prevAxisY) > 20) ||
+                       (abs(axisRX - prevAxisRX) > 20) || (abs(axisRY - prevAxisRY) > 20) ||
+                       (abs(brake - prevBrake) > 20) || (abs(throttle - prevThrottle) > 20);
+    bool buttonsChanged = (buttons != prevButtons) || (miscButtons != prevMiscButtons) || (dpad != prevDpad);
+
+    if (!buttonsChanged && !axesChanged) return;
+
+    // Update previous state
+    prevButtons = buttons;
+    prevMiscButtons = miscButtons;
+    prevDpad = dpad;
+    prevAxisX = axisX;  prevAxisY = axisY;
+    prevAxisRX = axisRX; prevAxisRY = axisRY;
+    prevBrake = brake;  prevThrottle = throttle;
+
+    // Build a string of all pressed buttons
+    String pressed = "";
+
+    // Face buttons
+    if (buttons & BUTTON_A)          pressed += "A ";
+    if (buttons & BUTTON_B)          pressed += "B ";
+    if (buttons & BUTTON_X)          pressed += "X ";
+    if (buttons & BUTTON_Y)          pressed += "Y ";
+
+    // Shoulder / Trigger buttons
+    if (buttons & BUTTON_SHOULDER_L) pressed += "L1 ";
+    if (buttons & BUTTON_SHOULDER_R) pressed += "R1 ";
+    if (buttons & BUTTON_TRIGGER_L)  pressed += "L2 ";
+    if (buttons & BUTTON_TRIGGER_R)  pressed += "R2 ";
+
+    // Thumb stick buttons
+    if (buttons & BUTTON_THUMB_L)    pressed += "ThumbL ";
+    if (buttons & BUTTON_THUMB_R)    pressed += "ThumbR ";
+
+    // D-Pad
+    if (dpad & DPAD_UP)    pressed += "DUp ";
+    if (dpad & DPAD_DOWN)  pressed += "DDown ";
+    if (dpad & DPAD_LEFT)  pressed += "DLeft ";
+    if (dpad & DPAD_RIGHT) pressed += "DRight ";
+
+    // Misc buttons
+    if (miscButtons & MISC_BUTTON_SYSTEM)  pressed += "System ";
+    if (miscButtons & MISC_BUTTON_SELECT)  pressed += "Select ";
+    if (miscButtons & MISC_BUTTON_START)   pressed += "Start ";
+    if (miscButtons & MISC_BUTTON_CAPTURE) pressed += "Capture ";
+
+    // Mocute 052: "OK" button maps to Throttle axis (1023 = pressed)
+    if (throttle > 500) pressed += "OK ";
+
+    if (pressed.length() == 0) pressed = "(none)";
+
+    Serial.printf("[BTN-DBG] Buttons: %-40s | Axes: LX=%4d LY=%4d RX=%4d RY=%4d | Brake=%3d Throttle=%3d | Raw: btn=0x%04X misc=0x%04X dpad=0x%02X\n",
+                  pressed.c_str(), axisX, axisY, axisRX, axisRY, brake, throttle, buttons, miscButtons, dpad);
+}
+
 // ========================== Process Gamepad ==========================
 
 void processGamepad(ControllerPtr ctl) {
@@ -355,6 +435,9 @@ void processGamepad(ControllerPtr ctl) {
 
     lastGamepadTime = millis();
 
+    // Debug: print all button/axis state on change (disabled)
+    // debugPrintButtons(ctl);
+
     // Read joystick axes
     // Bluepad32: axisX/axisY = left stick, axisRX/axisRY = right stick
     // Range: -512 to 511
@@ -364,8 +447,8 @@ void processGamepad(ControllerPtr ctl) {
     // Check buttons
     uint16_t buttons = ctl->buttons();
 
-    // Button A or R1 = Turbo mode
-    turboMode = (buttons & BUTTON_A) || (buttons & BUTTON_SHOULDER_R);
+    // Button A, R1, or OK (Throttle axis) = Turbo mode
+    turboMode = (buttons & BUTTON_A) || (buttons & BUTTON_SHOULDER_R) || (ctl->throttle() > 500);
 
     // Button B or L1 = Emergency stop
     emergencyStop = (buttons & BUTTON_B) || (buttons & BUTTON_SHOULDER_L);

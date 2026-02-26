@@ -344,8 +344,8 @@ Der Code funktioniert ohne Änderung mit allen von Bluepad32 unterstützten Cont
 ### Pin-Änderungen
 Die UART-Pins können in `main.cpp` angepasst werden:
 ```cpp
-#define HOVER_RX_PIN    16    // ESP32 RX
-#define HOVER_TX_PIN    17    // ESP32 TX
+#define HOVER_RX_PIN    4    // ESP32 RX
+#define HOVER_TX_PIN    5    // ESP32 TX
 ```
 
 ## Lizenz
