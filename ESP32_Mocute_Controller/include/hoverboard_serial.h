@@ -55,6 +55,10 @@ public:
         _serial.begin(HOVER_SERIAL_BAUD, SERIAL_8N1, _rxPin, _txPin);
     }
 
+    // Enable/disable debug output of sent/received frames
+    void setDebug(bool enable) { _debug = enable; }
+    bool getDebug() const { return _debug; }
+
     /**
      * @brief Send steer and speed command to the hoverboard
      * @param steer Steering value [-1000, 1000]. Negative=left, Positive=right
@@ -72,17 +76,35 @@ public:
         cmd.checksum = (uint16_t)(cmd.start ^ cmd.steer ^ cmd.speed);
 
         _serial.write((uint8_t *)&cmd, sizeof(cmd));
+
+        _lastCmd = cmd;
+        _sendCount++;
+
+        if (_debug) {
+            // Print decoded fields + raw hex bytes
+            Serial.printf("[HOVER-TX] #%lu steer=%4d speed=%4d chk=0x%04X | HEX:",
+                          _sendCount, cmd.steer, cmd.speed, cmd.checksum);
+            const uint8_t *p = (const uint8_t *)&cmd;
+            for (size_t i = 0; i < sizeof(cmd); i++) {
+                Serial.printf(" %02X", p[i]);
+            }
+            Serial.println();
+        }
     }
 
     /**
      * @brief Try to receive feedback from the hoverboard
+     * @param maxBytes Maximum bytes to process per call (0 = unlimited)
+     *                 Limits processing time to prevent WDT timeout.
      * @return true if a valid feedback frame was received
      */
-    bool receive() {
+    bool receive(uint16_t maxBytes = 512) {
         bool newData = false;
+        uint16_t bytesProcessed = 0;
 
-        while (_serial.available()) {
+        while (_serial.available() && (maxBytes == 0 || bytesProcessed < maxBytes)) {
             _incomingByte = _serial.read();
+            bytesProcessed++;
             _bufStartFrame = ((uint16_t)(_incomingByte) << 8) | _incomingBytePrev;
 
             // Detect start frame
@@ -106,6 +128,32 @@ public:
                 if (_newFeedback.start == HOVER_START_FRAME && checksum == _newFeedback.checksum) {
                     memcpy(&feedback, &_newFeedback, sizeof(SerialFeedback));
                     newData = true;
+                    _rxGoodCount++;
+                    if (_debug) {
+                        // Rate-limit debug output: max 2 prints/sec to prevent WDT
+                        unsigned long now = millis();
+                        if (now - _lastDebugPrintMs >= 500) {
+                            _lastDebugPrintMs = now;
+                            Serial.printf("[HOVER-RX] #%lu speedL=%d speedR=%d bat=%d temp=%d | HEX:",
+                                          _rxGoodCount, feedback.speedL_meas, feedback.speedR_meas,
+                                          feedback.batVoltage, feedback.boardTemp);
+                            const uint8_t *p = (const uint8_t *)&feedback;
+                            for (size_t i = 0; i < sizeof(SerialFeedback); i++) {
+                                Serial.printf(" %02X", p[i]);
+                            }
+                            Serial.println();
+                        }
+                    }
+                } else {
+                    _rxBadCount++;
+                    if (_debug) {
+                        unsigned long now = millis();
+                        if (now - _lastDebugPrintMs >= 500) {
+                            _lastDebugPrintMs = now;
+                            Serial.printf("[HOVER-RX] BAD FRAME #%lu (start=0x%04X, chk=0x%04X expected=0x%04X)\n",
+                                          _rxBadCount, _newFeedback.start, _newFeedback.checksum, checksum);
+                        }
+                    }
                 }
                 _idx = 0;
             }
@@ -119,10 +167,29 @@ public:
     // Public feedback data (updated by receive())
     SerialFeedback feedback = {};
 
+    // Statistics
+    unsigned long getSendCount() const { return _sendCount; }
+    unsigned long getRxGoodCount() const { return _rxGoodCount; }
+    unsigned long getRxBadCount() const { return _rxBadCount; }
+    SerialCommand getLastCommand() const { return _lastCmd; }
+
+    /**
+     * @brief Print a summary of UART communication status
+     */
+    void printStatus() {
+        Serial.printf("[HOVER-DBG] TX pin=%d, RX pin=%d, baud=%d\n", _txPin, _rxPin, HOVER_SERIAL_BAUD);
+        Serial.printf("[HOVER-DBG] Frames sent: %lu | RX good: %lu | RX bad: %lu\n",
+                      _sendCount, _rxGoodCount, _rxBadCount);
+        Serial.printf("[HOVER-DBG] Last TX: start=0x%04X steer=%d speed=%d chk=0x%04X\n",
+                      _lastCmd.start, _lastCmd.steer, _lastCmd.speed, _lastCmd.checksum);
+        Serial.printf("[HOVER-DBG] UART RX bytes available: %d\n", _serial.available());
+    }
+
 private:
     HardwareSerial &_serial;
     int _rxPin;
     int _txPin;
+    bool _debug = false;
 
     // Receive state
     uint8_t  _idx = 0;
@@ -131,6 +198,13 @@ private:
     byte     _incomingBytePrev = 0;
     byte    *_p = nullptr;
     SerialFeedback _newFeedback = {};
+
+    // Debug / statistics
+    SerialCommand _lastCmd = {};
+    unsigned long _sendCount = 0;
+    unsigned long _rxGoodCount = 0;
+    unsigned long _rxBadCount = 0;
+    unsigned long _lastDebugPrintMs = 0;
 };
 
 #endif // HOVERBOARD_SERIAL_H

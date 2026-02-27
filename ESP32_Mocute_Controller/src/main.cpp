@@ -127,6 +127,14 @@ unsigned long lastSendTime = 0;
 unsigned long lastGamepadTime = 0;
 bool gamepadConnected = false;
 
+// Connection stability: track controller health
+unsigned long lastControllerDataTime = 0;  // Last time we got valid data from controller
+int consecutiveEmptyPolls = 0;              // Counts loops without controller data
+
+// LED blink state for BT scanning indication
+unsigned long lastLedToggle = 0;
+bool ledState = false;
+
 // ========================== Helper Functions ==========================
 
 /**
@@ -168,64 +176,30 @@ void onConnectedController(ControllerPtr ctl) {
     bool foundEmptySlot = false;
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == nullptr) {
-            Serial.printf("[BP32] Controller connected, index=%d\n", i);
             myControllers[i] = ctl;
             foundEmptySlot = true;
-
-            // Print controller info
-            ControllerProperties properties = ctl->getProperties();
-            Serial.printf("[BP32] Controller model: %s, VID=0x%04x, PID=0x%04x\n",
-                          ctl->getModelName().c_str(),
-                          properties.vendor_id,
-                          properties.product_id);
-
-            // Print BT protocol type
-            if (ctl->isGamepad())        Serial.println("[BP32] Type: Gamepad");
-            else if (ctl->isMouse())     Serial.println("[BP32] Type: Mouse");
-            else if (ctl->isKeyboard())  Serial.println("[BP32] Type: Keyboard");
-            else if (ctl->isBalanceBoard()) Serial.println("[BP32] Type: Balance Board");
-            else                         Serial.println("[BP32] Type: Unknown");
-
-            // Print BT transport from Bluepad32 internals
-            uni_hid_device_t* dev = uni_hid_device_get_instance_for_idx(i);
-            if (dev != nullptr) {
-                const char* btProto = "Unknown";
-                switch (dev->conn.protocol) {
-                    case UNI_BT_CONN_PROTOCOL_BR_EDR: btProto = "BR/EDR (Classic BT)"; break;
-                    case UNI_BT_CONN_PROTOCOL_BLE:    btProto = "BLE (Bluetooth Low Energy)"; break;
-                    default: break;
-                }
-                Serial.printf("[BP32] BT Protocol: %s\n", btProto);
-                char addr_str[18];
-                snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                         dev->conn.btaddr[0], dev->conn.btaddr[1], dev->conn.btaddr[2],
-                         dev->conn.btaddr[3], dev->conn.btaddr[4], dev->conn.btaddr[5]);
-                Serial.printf("[BP32] BT Address: %s\n", addr_str);
-                Serial.printf("[BP32] Connection handle: 0x%04x\n", dev->conn.handle);
-            }
+            // Keep callback light — only minimal log here (BTstack context!)
+            Serial.printf("[BP32] Controller connected, index=%d\n", i);
             break;
         }
     }
     if (!foundEmptySlot) {
-        Serial.println("[BP32] CALLBACK: Controller connected, but no empty slot found");
+        Serial.println("[BP32] No empty slot for controller");
     }
 
     gamepadConnected = true;
+    lastControllerDataTime = millis();
+    consecutiveEmptyPolls = 0;
     digitalWrite(LED_PIN, HIGH);
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
-    bool foundController = false;
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == ctl) {
             Serial.printf("[BP32] Controller disconnected, index=%d\n", i);
             myControllers[i] = nullptr;
-            foundController = true;
             break;
         }
-    }
-    if (!foundController) {
-        Serial.println("[BP32] CALLBACK: Controller disconnected, but not found in list");
     }
 
     // Check if any controller is still connected
@@ -245,6 +219,42 @@ void onDisconnectedController(ControllerPtr ctl) {
         emergencyStop = false;
         digitalWrite(LED_PIN, LOW);
         Serial.println("[SAFETY] All controllers disconnected - motors stopped");
+    }
+}
+
+/**
+ * @brief Print detailed controller info (called from loop after connection, not callback)
+ */
+void printControllerInfo(int idx, ControllerPtr ctl) {
+    if (ctl == nullptr) return;
+
+    ControllerProperties properties = ctl->getProperties();
+    Serial.printf("[BP32] Controller model: %s, VID=0x%04x, PID=0x%04x\n",
+                  ctl->getModelName().c_str(),
+                  properties.vendor_id,
+                  properties.product_id);
+
+    if (ctl->isGamepad())        Serial.println("[BP32] Type: Gamepad");
+    else if (ctl->isMouse())     Serial.println("[BP32] Type: Mouse");
+    else if (ctl->isKeyboard())  Serial.println("[BP32] Type: Keyboard");
+    else if (ctl->isBalanceBoard()) Serial.println("[BP32] Type: Balance Board");
+    else                         Serial.println("[BP32] Type: Unknown");
+
+    uni_hid_device_t* dev = uni_hid_device_get_instance_for_idx(idx);
+    if (dev != nullptr) {
+        const char* btProto = "Unknown";
+        switch (dev->conn.protocol) {
+            case UNI_BT_CONN_PROTOCOL_BR_EDR: btProto = "BR/EDR (Classic BT)"; break;
+            case UNI_BT_CONN_PROTOCOL_BLE:    btProto = "BLE (Bluetooth Low Energy)"; break;
+            default: break;
+        }
+        Serial.printf("[BP32] BT Protocol: %s\n", btProto);
+        char addr_str[18];
+        snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 dev->conn.btaddr[0], dev->conn.btaddr[1], dev->conn.btaddr[2],
+                 dev->conn.btaddr[3], dev->conn.btaddr[4], dev->conn.btaddr[5]);
+        Serial.printf("[BP32] BT Address: %s\n", addr_str);
+        Serial.printf("[BP32] Connection handle: 0x%04x\n", dev->conn.handle);
     }
 }
 
@@ -566,75 +576,29 @@ void processGamepad(ControllerPtr ctl) {
 void setup() {
     // Initialize debug serial
     Serial.begin(115200);
-    delay(1000);  // Give BTstack time to fully initialize on Core 0
+    delay(500);  // Brief pause for BTstack init on Core 0
     Serial.println();
     Serial.println("============================================");
     Serial.println("  ESP32 Mocute 052 -> Hoverboard Controller");
-    Serial.println("       + Follow Me Mode (RSSI-based)");
-    Serial.println("       + Dual-ESP32 Direction Detection");
     Serial.println("============================================");
-    Serial.println();
-    Serial.flush();
 
-    Serial.println("[DBG] Step 1: LED setup...");
-    Serial.flush();
     // LED setup
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
-    Serial.println("[DBG] Step 2: Hoverboard serial...");
-    Serial.flush();
     // Initialize hoverboard serial
     hoverSerial.begin();
-    Serial.printf("[HOVER] Serial initialized at %d baud (RX=%d, TX=%d)\n",
+    hoverSerial.setDebug(false);
+    Serial.printf("[HOVER] UART at %d baud (RX=%d, TX=%d)\n",
                   HOVER_SERIAL_BAUD, HOVER_RX_PIN, HOVER_TX_PIN);
-    Serial.flush();
 
     // Send initial stop command
     hoverSerial.send(0, 0);
 
-    Serial.println("[DBG] Step 3: Bluepad32 setup...");
-    Serial.flush();
-    // Initialize Bluepad32
+    // Initialize Bluepad32 — keep setup() fast so BTstack can start scanning
     BP32.setup(&onConnectedController, &onDisconnectedController);
-    Serial.println("[DBG] Step 3: Bluepad32 setup DONE");
-    Serial.flush();
-
-    // ESP-NOW disabled: WiFi.mode(WIFI_STA) conflicts with Bluepad32's BTstack
-    // which directly controls the radio. This causes WDT reset.
-    // TODO: Investigate Bluepad32-compatible ESP-NOW initialization
-    Serial.println("[ESPNOW] ESP-NOW disabled (incompatible with BTstack radio control)");
-    Serial.println("[ESPNOW] Direction detection unavailable. Follow Me = distance-only.");
-    /*
-    Serial.println("[ESPNOW] Initializing ESP-NOW for Satellite communication...");
-    if (setupEspNow()) {
-        Serial.println("[ESPNOW] ESP-NOW ready. Satellite can connect for direction detection.");
-    } else {
-        Serial.println("[ESPNOW] ESP-NOW init failed. Direction detection unavailable.");
-        Serial.println("[ESPNOW] Follow Me will work with distance-only (no direction).");
-    }
-    */
-
-    // Optionally forget previously paired devices to allow new pairing
-    // BP32.forgetBluetoothKeys();
-
-    // Enable virtual devices (e.g., mouse, keyboard) - usually not needed for gamepad
-    // BP32.enableVirtualDevice(false);
-
-    Serial.println("[BP32]  Ready! Waiting for Mocute 052 gamepad...");
-    Serial.println("[BP32]  Turn on the Mocute 052 and set it to Game mode.");
-    Serial.println();
-    Serial.println("Controls:");
-    Serial.println("  Joystick L  = Steer + Speed");
-    Serial.println("  Button A/R1 = Turbo");
-    Serial.println("  Button B/L1 = Emergency Stop");
-    Serial.println("  Button X    = Toggle Follow Me mode");
-    Serial.println("  Button Y    = Print RSSI/Direction calibration values");
-    Serial.println();
-    Serial.println("Dual-ESP32:");
-    Serial.println("  Satellite auto-detected via ESP-NOW");
-    Serial.println("  When online: auto-steering in Follow Me mode");
-    Serial.println();
+    Serial.println("[BP32] Ready! Waiting for gamepad...");
+    Serial.println("[BP32] LED blinks = scanning, LED solid = connected");
 
     // Initialize controller slots
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
@@ -644,14 +608,69 @@ void setup() {
 
 // ========================== LOOP ==========================
 
+// One-shot flag to print controller info after connection (deferred from callback)
+static bool pendingControllerInfo = false;
+
 void loop() {
     // Must call this to process Bluepad32 events
     BP32.update();
 
-    // Process all connected controllers
+    // === LED: Blink while scanning, solid when connected ===
+    if (!gamepadConnected) {
+        unsigned long now = millis();
+        if (now - lastLedToggle > 300) {  // Blink at ~1.7Hz
+            lastLedToggle = now;
+            ledState = !ledState;
+            digitalWrite(LED_PIN, ledState);
+        }
+    }
+
+    // === Deferred controller info print (outside callback context) ===
+    if (gamepadConnected && !pendingControllerInfo) {
+        pendingControllerInfo = true;
+        for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+            if (myControllers[i] != nullptr) {
+                printControllerInfo(i, myControllers[i]);
+            }
+        }
+    }
+    if (!gamepadConnected) {
+        pendingControllerInfo = false;
+    }
+
+    // === Process connected controllers ===
+    bool gotInput = false;
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] != nullptr && myControllers[i]->isConnected()) {
             processGamepad(myControllers[i]);
+            gotInput = true;
+        }
+    }
+
+    // === Connection health watchdog ===
+    // Detect stale controllers that appear connected but send no data
+    if (gamepadConnected) {
+        if (gotInput) {
+            lastControllerDataTime = millis();
+            consecutiveEmptyPolls = 0;
+        } else {
+            consecutiveEmptyPolls++;
+        }
+
+        // If no data for 3 seconds, force-disconnect stale controllers
+        if (millis() - lastControllerDataTime > 3000 && lastControllerDataTime > 0) {
+            Serial.println("[BP32] Stale controller detected - clearing slots");
+            for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+                if (myControllers[i] != nullptr) {
+                    myControllers[i]->disconnect();
+                    myControllers[i] = nullptr;
+                }
+            }
+            gamepadConnected = false;
+            cmdSteer = 0;
+            cmdSpeed = 0;
+            lastControllerDataTime = 0;
+            digitalWrite(LED_PIN, LOW);
         }
     }
 
@@ -666,6 +685,12 @@ void loop() {
         }
     }
 
+    // === Hoverboard UART: receive a small chunk every loop pass ===
+    // Spread RX processing across loop iterations to prevent CPU spikes.
+    // At 115200 baud, ~1440 bytes/sec arrive. Processing 64 bytes per
+    // 10ms loop pass = 6400 bytes/sec capacity — more than enough.
+    hoverSerial.receive(64);
+
     // Send commands to hoverboard at fixed interval
     unsigned long now = millis();
     if (now - lastSendTime >= HOVER_SEND_INTERVAL) {
@@ -674,24 +699,37 @@ void loop() {
         // Send command
         hoverSerial.send(cmdSteer, cmdSpeed);
 
-        // Try to receive feedback
-        if (hoverSerial.receive()) {
-            static unsigned long lastFeedbackPrint = 0;
-            if (now - lastFeedbackPrint > 1000) {  // Print feedback every 1s
-                lastFeedbackPrint = now;
-                Serial.printf("[HOVER] Feedback: speedL=%d speedR=%d bat=%d.%dV temp=%d°C\n",
+        // Check for any remaining RX data after send
+        hoverSerial.receive(64);
+            // Print hoverboard feedback periodically
+        static unsigned long lastFeedbackPrint = 0;
+        if (now - lastFeedbackPrint > 1000) {
+            lastFeedbackPrint = now;
+            if (hoverSerial.getRxGoodCount() > 0) {
+                Serial.printf("[HOVER] speedL=%d speedR=%d bat=%d.%02dV temp=%d.%d°C\n",
                               hoverSerial.feedback.speedL_meas,
                               hoverSerial.feedback.speedR_meas,
                               hoverSerial.feedback.batVoltage / 100,
                               abs(hoverSerial.feedback.batVoltage % 100),
-                              hoverSerial.feedback.boardTemp / 10);
+                              hoverSerial.feedback.boardTemp / 10,
+                              abs(hoverSerial.feedback.boardTemp % 10));
             }
         }
 
-        // Debug output (every 500ms)
+        // Debug output (every 2s — reduced from 500ms to lower serial load)
         static unsigned long lastDebugPrint = 0;
-        if (now - lastDebugPrint > 500) {
+        if (now - lastDebugPrint > 2000) {
             lastDebugPrint = now;
+
+            // UART link status (always shown when debug is on)
+            if (hoverSerial.getDebug()) {
+                Serial.printf("[HOVER-STAT] TX#%lu RX_ok#%lu RX_bad#%lu | steer=%4d speed=%4d\n",
+                              hoverSerial.getSendCount(),
+                              hoverSerial.getRxGoodCount(),
+                              hoverSerial.getRxBadCount(),
+                              cmdSteer, cmdSpeed);
+            }
+
             if (followMe.isEnabled()) {
                 if (dirDetector.isAvailable()) {
                     Serial.printf("[FOLLOW] steer=%4d speed=%4d zone=%s dir=%s rssi_m=%u rssi_s=%u diff=%.0f\n",
@@ -713,6 +751,7 @@ void loop() {
         }
     }
 
-    // Small delay to prevent WDT issues
+    // Yield to RTOS to prevent WDT timeout on IDLE1 task
+    // 1 tick = 10ms at 100Hz tick rate
     vTaskDelay(1);
 }
