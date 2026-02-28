@@ -1,17 +1,30 @@
 /**
  * @file main.cpp
- * @brief ESP32 Bluetooth Gamepad Receiver for Hoverboard Control
+ * @brief ESP32 Bluetooth Gamepad Receiver for Hoverboard Control (AWD support)
  *
  * Receives input from a Mocute 052 Bluetooth gamepad via Bluepad32
- * and sends steer/speed commands to the hoverboard mainboard via UART.
+ * and sends steer/speed commands to the hoverboard mainboard(s) via UART.
  *
- * Hardware Connections (ESP32 -> Hoverboard):
- *   ESP32 GPIO16 (RX2) -> Hoverboard TX (Green wire on sensor cable)
- *   ESP32 GPIO17 (TX2) -> Hoverboard RX (Yellow wire on sensor cable)
+ * AWD Mode (DUAL_BOARD_ENABLE):
+ *   Two hoverboard mainboards are controlled independently:
+ *   - Board 1 (Front): Serial2 on HOVER_RX_PIN / HOVER_TX_PIN
+ *   - Board 2 (Rear):  Serial1 on HOVER_REAR_RX_PIN / HOVER_REAR_TX_PIN
+ *   The rear board receives the same speed but reduced steering
+ *   (configurable via REAR_STEER_FACTOR, default 30%).
+ *
+ * Hardware Connections (ESP32 -> Hoverboard Front / Board 1):
+ *   ESP32 GPIO25 (RX2) -> Hoverboard TX (Green wire on sensor cable)
+ *   ESP32 GPIO26 (TX2) -> Hoverboard RX (Yellow wire on sensor cable)
  *   ESP32 GND          -> Hoverboard GND (Black wire on sensor cable)
  *   WARNING: Do NOT connect the red 15V wire!
  *
- * Hoverboard config.h must have:
+ * Hardware Connections (ESP32 -> Hoverboard Rear / Board 2):
+ *   ESP32 GPIO8  (RX1) -> Hoverboard TX (Green wire on sensor cable)
+ *   ESP32 GPIO9  (TX1) -> Hoverboard RX (Yellow wire on sensor cable)
+ *   ESP32 GND          -> Hoverboard GND (Black wire on sensor cable)
+ *   WARNING: Do NOT connect the red 15V wire!
+ *
+ * Both hoverboard config.h must have:
  *   #define CONTROL_SERIAL_USART3   (right sensor cable)
  *   #define FEEDBACK_SERIAL_USART3
  *   or
@@ -74,6 +87,20 @@ extern "C" {
   #define HOVER_TX_PIN    26    // Default for ESP32 (override via build_flags)
 #endif
 
+// UART1 pins for second (rear) hoverboard - AWD mode
+#ifndef HOVER_REAR_RX_PIN
+  #define HOVER_REAR_RX_PIN  8   // Default GPIO8 (override via build_flags)
+#endif
+#ifndef HOVER_REAR_TX_PIN
+  #define HOVER_REAR_TX_PIN  9   // Default GPIO9 (override via build_flags)
+#endif
+
+// AWD: rear board steering factor (0.0 - 1.0 in percent, 30 = 30%)
+// Rear wheels typically need less steering than front wheels
+#ifndef REAR_STEER_PERCENT
+  #define REAR_STEER_PERCENT  30  // 30% of front steering applied to rear
+#endif
+
 // Status LED
 #ifndef LED_PIN
   #ifdef CONFIG_IDF_TARGET_ESP32S3
@@ -92,8 +119,8 @@ extern "C" {
 #define JOYSTICK_INPUT_MAX   511
 
 // Speed limits
-#define SPEED_LIMIT_NORMAL  300   // Normal speed limit [-1000, 1000]
-#define SPEED_LIMIT_TURBO   600   // Turbo speed limit (when turbo button held)
+#define SPEED_LIMIT_NORMAL  500   // Normal speed limit [-1000, 1000] (was 300)
+#define SPEED_LIMIT_TURBO   800   // Turbo speed limit (when turbo button held) (was 600)
 #define STEER_LIMIT         400   // Steering limit [-1000, 1000]
 
 // Safety: timeout if no gamepad data received
@@ -102,8 +129,13 @@ extern "C" {
 // ========================== Global Variables ==========================
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
-// Hoverboard serial interface on UART2
+// Hoverboard serial interface: Front board on UART2
 HoverboardSerial hoverSerial(Serial2, HOVER_RX_PIN, HOVER_TX_PIN);
+
+// AWD: Rear board on UART1 (only active when DUAL_BOARD_ENABLE is defined)
+#ifdef DUAL_BOARD_ENABLE
+HoverboardSerial hoverSerialRear(Serial1, HOVER_REAR_RX_PIN, HOVER_REAR_TX_PIN);
+#endif
 
 // Current command values
 int16_t cmdSteer = 0;
@@ -586,14 +618,26 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
-    // Initialize hoverboard serial
+    // Initialize hoverboard serial (Front / Board 1)
     hoverSerial.begin();
     hoverSerial.setDebug(false);
-    Serial.printf("[HOVER] UART at %d baud (RX=%d, TX=%d)\n",
+    Serial.printf("[HOVER-FRONT] UART2 at %d baud (RX=%d, TX=%d)\n",
                   HOVER_SERIAL_BAUD, HOVER_RX_PIN, HOVER_TX_PIN);
 
     // Send initial stop command
     hoverSerial.send(0, 0);
+
+    // AWD: Initialize rear hoverboard serial (Rear / Board 2)
+    #ifdef DUAL_BOARD_ENABLE
+    hoverSerialRear.begin();
+    hoverSerialRear.setDebug(false);
+    Serial.printf("[HOVER-REAR]  UART1 at %d baud (RX=%d, TX=%d)\n",
+                  HOVER_SERIAL_BAUD, HOVER_REAR_RX_PIN, HOVER_REAR_TX_PIN);
+    hoverSerialRear.send(0, 0);
+    Serial.printf("[AWD] Dual-board AWD mode ENABLED (rear steer = %d%%)\n", REAR_STEER_PERCENT);
+    #else
+    Serial.println("[AWD] Single-board mode (define DUAL_BOARD_ENABLE for AWD)");
+    #endif
 
     // Initialize Bluepad32 — keep setup() fast so BTstack can start scanning
     BP32.setup(&onConnectedController, &onDisconnectedController);
@@ -690,23 +734,35 @@ void loop() {
     // At 115200 baud, ~1440 bytes/sec arrive. Processing 64 bytes per
     // 10ms loop pass = 6400 bytes/sec capacity — more than enough.
     hoverSerial.receive(64);
+    #ifdef DUAL_BOARD_ENABLE
+    hoverSerialRear.receive(64);
+    #endif
 
     // Send commands to hoverboard at fixed interval
     unsigned long now = millis();
     if (now - lastSendTime >= HOVER_SEND_INTERVAL) {
         lastSendTime = now;
 
-        // Send command
+        // Send command to front board
         hoverSerial.send(cmdSteer, cmdSpeed);
+
+        // AWD: Send command to rear board (reduced steering)
+        #ifdef DUAL_BOARD_ENABLE
+        int16_t rearSteer = (int16_t)((int32_t)cmdSteer * REAR_STEER_PERCENT / 100);
+        hoverSerialRear.send(rearSteer, cmdSpeed);
+        #endif
 
         // Check for any remaining RX data after send
         hoverSerial.receive(64);
+        #ifdef DUAL_BOARD_ENABLE
+        hoverSerialRear.receive(64);
+        #endif
             // Print hoverboard feedback periodically
         static unsigned long lastFeedbackPrint = 0;
         if (now - lastFeedbackPrint > 1000) {
             lastFeedbackPrint = now;
             if (hoverSerial.getRxGoodCount() > 0) {
-                Serial.printf("[HOVER] speedL=%d speedR=%d bat=%d.%02dV temp=%d.%d°C\n",
+                Serial.printf("[FRONT] speedL=%d speedR=%d bat=%d.%02dV temp=%d.%d°C\n",
                               hoverSerial.feedback.speedL_meas,
                               hoverSerial.feedback.speedR_meas,
                               hoverSerial.feedback.batVoltage / 100,
@@ -714,6 +770,17 @@ void loop() {
                               hoverSerial.feedback.boardTemp / 10,
                               abs(hoverSerial.feedback.boardTemp % 10));
             }
+            #ifdef DUAL_BOARD_ENABLE
+            if (hoverSerialRear.getRxGoodCount() > 0) {
+                Serial.printf("[REAR]  speedL=%d speedR=%d bat=%d.%02dV temp=%d.%d°C\n",
+                              hoverSerialRear.feedback.speedL_meas,
+                              hoverSerialRear.feedback.speedR_meas,
+                              hoverSerialRear.feedback.batVoltage / 100,
+                              abs(hoverSerialRear.feedback.batVoltage % 100),
+                              hoverSerialRear.feedback.boardTemp / 10,
+                              abs(hoverSerialRear.feedback.boardTemp % 10));
+            }
+            #endif
         }
 
         // Debug output (every 2s — reduced from 500ms to lower serial load)
@@ -723,12 +790,22 @@ void loop() {
 
             // UART link status (always shown when debug is on)
             if (hoverSerial.getDebug()) {
-                Serial.printf("[HOVER-STAT] TX#%lu RX_ok#%lu RX_bad#%lu | steer=%4d speed=%4d\n",
+                Serial.printf("[FRONT-STAT] TX#%lu RX_ok#%lu RX_bad#%lu | steer=%4d speed=%4d\n",
                               hoverSerial.getSendCount(),
                               hoverSerial.getRxGoodCount(),
                               hoverSerial.getRxBadCount(),
                               cmdSteer, cmdSpeed);
             }
+            #ifdef DUAL_BOARD_ENABLE
+            if (hoverSerialRear.getDebug()) {
+                int16_t rearSteerDbg = (int16_t)((int32_t)cmdSteer * REAR_STEER_PERCENT / 100);
+                Serial.printf("[REAR-STAT]  TX#%lu RX_ok#%lu RX_bad#%lu | steer=%4d speed=%4d\n",
+                              hoverSerialRear.getSendCount(),
+                              hoverSerialRear.getRxGoodCount(),
+                              hoverSerialRear.getRxBadCount(),
+                              rearSteerDbg, cmdSpeed);
+            }
+            #endif
 
             if (followMe.isEnabled()) {
                 if (dirDetector.isAvailable()) {
