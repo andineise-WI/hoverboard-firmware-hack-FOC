@@ -9,9 +9,10 @@
 
 // ========================== RC RECEIVER PINS (HOTRC DS650) ==================
 // Connect the PWM signal wires from the RC receiver to these digital pins.
-// IMPORTANT: The RA4M1 GPIO pins are 3.3 V only!
+// IMPORTANT (UNO R4 Minima): The RA4M1 GPIO pins are 3.3 V only!
 //   - If your receiver outputs 5 V signals, use a voltage divider or
 //     level-shifter, OR power the receiver from 3.3 V (many work fine).
+// NOTE (WeAct RA4M1 64Pin 5V): I/O runs at 5 V — no level-shifter needed.
 //
 // NOTE: NOT all digital pins on the UNO R4 Minima support external interrupts!
 //   Only these pins have IRQ capability:
@@ -53,11 +54,29 @@
 
 // ---- Board 2 (REAR axle) ----
 // Uses a second UART instance on D11 (TX) and D12 (RX).
-// On the RA4M1 these map to P411/P410 (SCI0).
+// On the RA4M1 these map to P109/P110 (SCI9).
 // Connect:  RA4M1 D11 (TX) → Hoverboard USART3 RX
 //           RA4M1 D12 (RX) ← Hoverboard USART3 TX
 #define PIN_BOARD2_TX       11
 #define PIN_BOARD2_RX       12
+
+// ========================== PIN MAPPING REFERENCE ============================
+//  Arduino Pin  │ Renesas Port  │ LQFP64 Pin#  │ WeAct Label  │ Function
+//  ─────────────┼───────────────┼──────────────┼──────────────┼──────────────
+//  D0           │ P301          │ 31           │ P301         │ Serial1 RX (Board1)
+//  D1           │ P302          │ 30           │ P302         │ Serial1 TX (Board1)
+//  D2           │ P105          │ 43           │ P105         │ RC CH1 (IRQ0)
+//  D3           │ P104          │ 44           │ P104         │ RC CH2 (IRQ1)
+//  D8           │ P304          │ 28           │ P304         │ RC CH3 (IRQ9)
+//  A2 (D16)     │ P001          │ 63           │ P001         │ RC CH4 (IRQ7)
+//  D11          │ P109          │ 34           │ P109         │ Board2 TX (SCI9)
+//  D12          │ P110          │ 35           │ P110         │ Board2 RX (SCI9)
+//  D13          │ P111          │ 36           │ P111         │ LED
+//  A0 (D14)     │ P014          │ 53           │ P014         │ (unused)
+//  A1 (D15)     │ P000          │ 64           │ P000         │ (unused)
+//  A3 (D17)     │ P002          │ 62           │ P002         │ (unused)
+//  A4 (D18)     │ P101          │ 47           │ P101         │ I2C SDA
+//  A5 (D19)     │ P100          │ 48           │ P100         │ I2C SCL
 
 // ========================== 4WD MIXING ======================================
 //
