@@ -13,6 +13,7 @@
 // =============================================================================
 
 #include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
 #include "config.h"
 
 // Define PIN_LED if not already defined in config.h
@@ -64,6 +65,10 @@ UART Board2Serial(PIN_BOARD2_TX, PIN_BOARD2_RX);
 // Convenience references
 #define BOARD1_SERIAL   Serial1
 #define BOARD2_SERIAL   Board2Serial
+
+#if WS2812_ENABLE
+static Adafruit_NeoPixel statusLeds(WS2812_LED_COUNT, WS2812_PIN, NEO_GRB + NEO_KHZ800);
+#endif
 
 // ─────────────────────── RC RECEIVER VARIABLES ──────────────────────────────
 
@@ -138,6 +143,11 @@ static bool    ch4ButtonPressed   = false;
 static unsigned long ch3LastToggle = 0;
 static unsigned long ch4LastToggle = 0;
 
+enum StatusLedIndex : uint8_t {
+    STATUS_LED_MODE = 0,
+    STATUS_LED_SPEED = 1,
+};
+
 // ───────────────────────── HELPER FUNCTIONS ─────────────────────────────────
 
 // Constrain to command range
@@ -198,6 +208,44 @@ static int16_t mapRC(uint16_t pulseWidth) {
 
     return clampCmd(cmd);
 }
+
+#if WS2812_ENABLE
+static uint32_t wsColor(uint8_t red, uint8_t green, uint8_t blue) {
+    return statusLeds.Color(red, green, blue);
+}
+
+static uint32_t getDriveModeColor(uint8_t mode) {
+    switch (mode) {
+        case MODE_CRAWL: return wsColor(0, 0, 255);
+        case MODE_SPORT: return wsColor(255, 0, 0);
+        default:         return wsColor(0, 255, 0);
+    }
+}
+
+static uint32_t getSpeedLimitColor(uint8_t percent) {
+    switch (percent) {
+        case 25:  return wsColor(0, 0, 255);
+        case 50:  return wsColor(0, 255, 0);
+        case 75:  return wsColor(255, 255, 0);
+        case 100: return wsColor(255, 0, 0);
+        default:  return wsColor(255, 255, 255);
+    }
+}
+
+static void updateStatusLeds(bool failsafe) {
+    if (WS2812_LED_COUNT < 2) return;
+
+    if (failsafe) {
+        uint32_t blinkColor = ((millis() / 125U) % 2U) ? wsColor(255, 0, 0) : wsColor(0, 0, 0);
+        statusLeds.setPixelColor(STATUS_LED_MODE, blinkColor);
+        statusLeds.setPixelColor(STATUS_LED_SPEED, blinkColor);
+    } else {
+        statusLeds.setPixelColor(STATUS_LED_MODE, getDriveModeColor(driveMode));
+        statusLeds.setPixelColor(STATUS_LED_SPEED, getSpeedLimitColor(speedLimitSteps[speedLimitStepIdx]));
+    }
+    statusLeds.show();
+}
+#endif
 
 // ──────────────────── HOVERBOARD UART: SEND ─────────────────────────────────
 
@@ -320,6 +368,13 @@ void setup() {
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, LOW);
 
+#if WS2812_ENABLE
+    statusLeds.begin();
+    statusLeds.setBrightness(WS2812_BRIGHTNESS);
+    statusLeds.clear();
+    statusLeds.show();
+#endif
+
     tSend  = millis();
     tDebug = millis();
 
@@ -433,6 +488,10 @@ void loop() {
         // Slow blink when idle (1 Hz)
         digitalWrite(PIN_LED, (now / 500) % 2);
     }
+
+#if WS2812_ENABLE
+    updateStatusLeds(failsafe);
+#endif
 
     // ── 3. Debug output ─────────────────────────────────────────────────
 #if DEBUG_ENABLE

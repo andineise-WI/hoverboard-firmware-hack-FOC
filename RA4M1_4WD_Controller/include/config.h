@@ -143,6 +143,16 @@
 #define FEEDBACK_BOARD1      true   // read feedback from front board
 #define FEEDBACK_BOARD2      true   // read feedback from rear board
 
+// ========================== WS2812 STATUS LED ===============================
+// Two WS2812 LEDs on one data pin:
+//   LED 0 = drive mode    (CRAWL=blue, NORMAL=green, SPORT=red)
+//   LED 1 = speed override (25%=blue, 50%=green, 75%=yellow, 100%=red)
+// Default pin A0 is unused in this project and suitable as a data output.
+#define WS2812_ENABLE        true
+#define WS2812_PIN           A0
+#define WS2812_LED_COUNT     2
+#define WS2812_BRIGHTNESS    32     // 0..255
+
 // ========================== DEBUG ===========================================
 #define DEBUG_ENABLE         true   // Send debug info over USB Serial
 #define DEBUG_BAUD           115200 // USB Serial baud rate
