@@ -101,8 +101,8 @@
 #define REAR_SPEED_INVERT   false
 
 // Command output range sent to the hoverboard (must match hoverboard config.h INPUT range)
-#define CMD_MIN             -1000
-#define CMD_MAX              1000
+#define CMD_MIN             -1500
+#define CMD_MAX              1500
 
 // Input dead-band AFTER mapping to command range
 #define CMD_DEADBAND         30     // values below ±30 are treated as 0
